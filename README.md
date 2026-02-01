@@ -5,6 +5,9 @@ ESPHome display driver for the ST7305 reflective LCD controller.
 **Supported Hardware:** [Waveshare ESP32-S3-RLCD-4.2](https://docs.waveshare.com/ESP32-S3-RLCD-4.2) and similar displays.\
 **Note** *This module was vibe coded* 
 
+![PXL_20260201_010637447 RAW-01 COVER-rs](https://github.com/user-attachments/assets/48f37f0f-299a-475a-80f8-cf618c1e873c)
+
+
 ## Features
 
 - 400x300 pixel resolution
