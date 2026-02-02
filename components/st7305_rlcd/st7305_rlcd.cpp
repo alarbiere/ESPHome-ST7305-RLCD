@@ -1,116 +1,167 @@
 /**
  * @file st7305_rlcd.cpp
- * @brief Implementation of ST7305 RLCD driver for ESPHome
+ * @brief ESPHome driver for ST7305 reflective LCD displays
+ *
+ * Reference implementations:
+ * - Waveshare Arduino driver (display_bsp.cpp)
+ * - Waveshare XiaoZhi driver (custom_lcd_display.cc)
+ *
+ * @version 2.0.0
  */
 
 #include "st7305_rlcd.h"
 #include "esphome/core/log.h"
-#include <cstring>
-
-#ifdef USE_ESP32
-#include <esp_heap_caps.h>
-#endif
+#include "esphome/core/helpers.h"
 
 namespace esphome {
 namespace st7305_rlcd {
 
-// Import display types into namespace
-using display::COLOR_OFF;
-using display::COLOR_ON;
-using display::Rect;
-
 static const char *const TAG = "st7305_rlcd";
 
 // =============================================================================
-// Component Lifecycle
+// Setup and Configuration
 // =============================================================================
 
 void ST7305RLCD::setup() {
-  ESP_LOGI(TAG, "Initializing ST7305 RLCD (400x300)");
+  ESP_LOGCONFIG(TAG, "Setting up ST7305 RLCD...");
 
-  // Validate and configure DC pin
-  if (this->dc_pin_ == nullptr) {
-    ESP_LOGE(TAG, "DC pin not configured");
-    this->mark_failed();
-    return;
-  }
+  // Apply model-specific settings
+  this->apply_model_settings_();
+
+  // Configure pins
   this->dc_pin_->setup();
-  this->dc_pin_->digital_write(false);
+  this->dc_pin_->digital_write(true);
 
-  // Configure reset pin if provided
   if (this->reset_pin_ != nullptr) {
     this->reset_pin_->setup();
-    this->reset_pin_->digital_write(true);
   }
 
   // Initialize SPI
   this->spi_setup();
 
-  // Hardware initialization
-  this->hardware_reset_();
-  this->init_display_();
-
   // Allocate display buffer
-  this->init_internal_(ST7305_BUFFER_SIZE);
+  ExternalRAMAllocator<uint8_t> buffer_allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
+  this->buffer_ = buffer_allocator.allocate(this->buffer_size_);
   if (this->buffer_ == nullptr) {
-    ESP_LOGE(TAG, "Buffer allocation failed");
+    ESP_LOGE(TAG, "Failed to allocate display buffer (%zu bytes)", this->buffer_size_);
     this->mark_failed();
     return;
   }
+  memset(this->buffer_, 0xFF, this->buffer_size_);
 
   // Initialize pixel lookup tables
   this->init_pixel_lut_();
   if (this->pixel_index_lut_ == nullptr || this->pixel_bit_lut_ == nullptr) {
-    ESP_LOGE(TAG, "LUT allocation failed");
+    ESP_LOGE(TAG, "Failed to allocate pixel LUTs");
     this->mark_failed();
     return;
   }
 
-  // Clear display
-  this->fill(COLOR_OFF);
-  this->write_display_();
+  // Hardware initialization
+  this->hardware_reset_();
+  this->init_display_();
 
-  ESP_LOGI(TAG, "Initialization complete");
+  ESP_LOGCONFIG(TAG, "ST7305 RLCD setup complete");
+}
+
+void ST7305RLCD::apply_model_settings_() {
+  switch (this->model_) {
+    case ST7305_MODEL_WAVESHARE_400X300:
+      this->width_ = 400;
+      this->height_ = 300;
+      this->orientation_ = ST7305_ORIENTATION_LANDSCAPE;
+      this->buffer_size_ = (400 * 300) / 8;  // 15000 bytes
+      this->col_start_ = 0x12;
+      this->col_end_ = 0x2A;
+      this->row_start_ = 0x00;
+      this->row_end_ = 0xC7;
+      break;
+
+    case ST7305_MODEL_OSPTEK_200X200:
+      this->width_ = 200;
+      this->height_ = 200;
+      this->orientation_ = ST7305_ORIENTATION_PORTRAIT;
+      this->buffer_size_ = (200 * 200) / 8;  // 5000 bytes
+      // Address window for 200×200 - estimated based on panel size
+      this->col_start_ = 0x13;
+      this->col_end_ = 0x25;
+      this->row_start_ = 0x00;
+      this->row_end_ = 0x63;
+      break;
+
+    case ST7305_MODEL_CUSTOM:
+      // User has set width_, height_, orientation_ directly
+      this->buffer_size_ = (this->width_ * this->height_) / 8;
+      // User should also set address window via separate methods if needed
+      break;
+  }
+
+  ESP_LOGD(TAG, "Model settings: %dx%d, %s, buffer=%zu bytes",
+           this->width_, this->height_,
+           this->orientation_ == ST7305_ORIENTATION_LANDSCAPE ? "landscape" : "portrait",
+           this->buffer_size_);
 }
 
 void ST7305RLCD::dump_config() {
   LOG_DISPLAY("", "ST7305 RLCD", this);
-  ESP_LOGCONFIG(TAG, "  Resolution: %dx%d", this->get_width(), this->get_height());
-  LOG_PIN("  DC Pin: ", this->dc_pin_);
-  LOG_PIN("  Reset Pin: ", this->reset_pin_);
-  LOG_UPDATE_INTERVAL(this);
-}
 
-void ST7305RLCD::update() {
-  if (this->buffer_ == nullptr)
-    return;
-
-  // Clear buffer to white
-  std::memset(this->buffer_, 0xFF, ST7305_BUFFER_SIZE);
-
-  // Set up clipping using rotated dimensions (get_width/get_height handle rotation)
-  this->start_clipping(Rect(0, 0, this->get_width(), this->get_height()));
-
-  // Execute user's lambda
-  if (this->writer_.has_value()) {
-    (*this->writer_)(*this);
+  const char *model_name;
+  switch (this->model_) {
+    case ST7305_MODEL_WAVESHARE_400X300:
+      model_name = "Waveshare 400x300";
+      break;
+    case ST7305_MODEL_OSPTEK_200X200:
+      model_name = "Osptek 200x200";
+      break;
+    case ST7305_MODEL_CUSTOM:
+      model_name = "Custom";
+      break;
+    default:
+      model_name = "Unknown";
   }
 
-  this->end_clipping();
+  ESP_LOGCONFIG(TAG, "  Model: %s", model_name);
+  ESP_LOGCONFIG(TAG, "  Resolution: %dx%d", this->width_, this->height_);
+  ESP_LOGCONFIG(TAG, "  Orientation: %s",
+                this->orientation_ == ST7305_ORIENTATION_LANDSCAPE ? "Landscape (2x4)" : "Portrait (4x2)");
+  ESP_LOGCONFIG(TAG, "  Buffer Size: %zu bytes", this->buffer_size_);
+  ESP_LOGCONFIG(TAG, "  Rotated Size: %dx%d", this->get_width(), this->get_height());
+  LOG_PIN("  DC Pin: ", this->dc_pin_);
+  LOG_PIN("  Reset Pin: ", this->reset_pin_);
+}
 
-  // Transfer buffer to display
+// =============================================================================
+// Display Operations
+// =============================================================================
+
+void ST7305RLCD::update() {
+  this->do_update_();
   this->write_display_();
 }
 
 void ST7305RLCD::fill(Color color) {
-  if (this->buffer_ == nullptr)
+  const uint8_t fill_value = (color.is_on()) ? 0x00 : 0xFF;
+  memset(this->buffer_, fill_value, this->buffer_size_);
+}
+
+void ST7305RLCD::draw_absolute_pixel_internal(int x, int y, Color color) {
+  if (x < 0 || x >= this->width_ || y < 0 || y >= this->height_)
     return;
-  // 0xFF = white (all bits set), 0x00 = black (all bits clear)
-  std::memset(this->buffer_, color.is_on() ? 0x00 : 0xFF, ST7305_BUFFER_SIZE);
+
+  // O(1) lookup using precomputed tables
+  const uint32_t pixel_idx = static_cast<uint32_t>(x) * this->height_ + y;
+  const uint16_t buffer_idx = this->pixel_index_lut_[pixel_idx];
+  const uint8_t bit_mask = this->pixel_bit_lut_[pixel_idx];
+
+  if (color.is_on()) {
+    this->buffer_[buffer_idx] &= ~bit_mask;  // Black = bit clear
+  } else {
+    this->buffer_[buffer_idx] |= bit_mask;   // White = bit set
+  }
 }
 
 // =============================================================================
-// Hardware Reset
+// Hardware Initialization
 // =============================================================================
 
 void ST7305RLCD::hardware_reset_() {
@@ -118,63 +169,60 @@ void ST7305RLCD::hardware_reset_() {
     return;
 
   this->reset_pin_->digital_write(true);
-  delay(10);
+  delay(50);
   this->reset_pin_->digital_write(false);
-  delay(10);
+  delay(20);
   this->reset_pin_->digital_write(true);
-  delay(120);
+  delay(50);
 }
 
-// =============================================================================
-// Display Initialization
-// CRITICAL: This sequence is hardware-specific and must match the panel.
-// Values derived from working Waveshare Arduino driver.
-// =============================================================================
-
 void ST7305RLCD::init_display_() {
-  // NVM Load Control
+  // Initialization sequence from Waveshare reference driver
+  // Most commands are common across ST7305 panels
+
+  // NVM Load Control - Load settings from non-volatile memory
   this->send_command_(0xD6);
   this->send_data_(0x17);
   this->send_data_(0x02);
 
-  // Booster Enable
+  // Booster Enable - Enable charge pump
   this->send_command_(0xD1);
   this->send_data_(0x01);
 
-  // Gate Voltage Control
+  // Gate Voltage Setting - VGH/VGL voltages
   this->send_command_(0xC0);
   this->send_data_(0x11);
   this->send_data_(0x04);
 
-  // VSHP Setting
+  // VSHP Setting - Positive source voltage (high power mode)
   this->send_command_(0xC1);
   this->send_data_(0x69);
   this->send_data_(0x69);
   this->send_data_(0x69);
   this->send_data_(0x69);
 
-  // VSLP Setting
+  // VSLP Setting - Positive source voltage (low power mode)
   this->send_command_(0xC2);
   this->send_data_(0x19);
   this->send_data_(0x19);
   this->send_data_(0x19);
   this->send_data_(0x19);
 
-  // VSHN Setting
+  // VSHN Setting - Negative source voltage (high power mode)
   this->send_command_(0xC4);
   this->send_data_(0x4B);
   this->send_data_(0x4B);
   this->send_data_(0x4B);
   this->send_data_(0x4B);
 
-  // VSLN Setting
+  // VSLN Setting - Negative source voltage (low power mode)
   this->send_command_(0xC5);
   this->send_data_(0x19);
   this->send_data_(0x19);
   this->send_data_(0x19);
   this->send_data_(0x19);
 
-  // OSC Setting
+  // OSC Setting - Oscillator frequency control
   this->send_command_(0xD8);
   this->send_data_(0x80);
   this->send_data_(0xE9);
@@ -183,7 +231,7 @@ void ST7305RLCD::init_display_() {
   this->send_command_(0xB2);
   this->send_data_(0x02);
 
-  // Gate EQ Control (High Power Mode)
+  // Gate EQ Control (High Power Mode) - Update period timing
   this->send_command_(0xB3);
   this->send_data_(0xE5);
   this->send_data_(0xF6);
@@ -196,7 +244,7 @@ void ST7305RLCD::init_display_() {
   this->send_data_(0x76);
   this->send_data_(0x45);
 
-  // Gate EQ Control (Low Power Mode)
+  // Gate EQ Control (Low Power Mode) - Update period timing
   this->send_command_(0xB4);
   this->send_data_(0x05);
   this->send_data_(0x46);
@@ -207,7 +255,7 @@ void ST7305RLCD::init_display_() {
   this->send_data_(0x76);
   this->send_data_(0x45);
 
-  // Unknown command 0x62
+  // Gate Timing Control
   this->send_command_(0x62);
   this->send_data_(0x32);
   this->send_data_(0x03);
@@ -217,46 +265,53 @@ void ST7305RLCD::init_display_() {
   this->send_command_(0xB7);
   this->send_data_(0x13);
 
-  // Gate Line Setting
+  // Gate Line Setting - Number of gate lines (panel-specific)
   this->send_command_(0xB0);
-  this->send_data_(0x64);
+  if (this->model_ == ST7305_MODEL_WAVESHARE_400X300) {
+    this->send_data_(0x64);  // 100 * 3 = 300 lines
+  } else if (this->model_ == ST7305_MODEL_OSPTEK_200X200) {
+    this->send_data_(0x32);  // 50 * 4 = 200 lines
+  } else {
+    // Custom: calculate based on height
+    this->send_data_(static_cast<uint8_t>(this->height_ / 3));
+  }
 
-  // Sleep Out
+  // Sleep Out - Exit sleep mode
   this->send_command_(0x11);
   delay(200);
 
-  // VSHL Select
+  // Source Voltage Select - Use VSHP1/VSLP1/VSHN1/VSLN1
   this->send_command_(0xC9);
   this->send_data_(0x00);
 
-  // Memory Data Access Control
+  // Memory Data Access Control (MADCTL) - MX=1, DO=1
   this->send_command_(0x36);
   this->send_data_(0x48);
 
-  // Data Format Select (1-bit mode)
+  // Data Format Select - 1-bit monochrome mode
   this->send_command_(0x3A);
   this->send_data_(0x11);
 
-  // Gamma Mode Setting
+  // Gamma Mode Setting - Monochrome mode
   this->send_command_(0xB9);
   this->send_data_(0x20);
 
-  // Panel Setting
+  // Panel Setting - 1-dot inversion, frame inversion, interlace
   this->send_command_(0xB8);
   this->send_data_(0x29);
 
   // Display Inversion On
   this->send_command_(0x21);
 
-  // Column Address Set
+  // Column Address Set - Panel specific
   this->send_command_(0x2A);
-  this->send_data_(0x12);
-  this->send_data_(0x2A);
+  this->send_data_(this->col_start_);
+  this->send_data_(this->col_end_);
 
-  // Row Address Set
+  // Row Address Set - Panel specific
   this->send_command_(0x2B);
-  this->send_data_(0x00);
-  this->send_data_(0xC7);
+  this->send_data_(this->row_start_);
+  this->send_data_(this->row_end_);
 
   // Tearing Effect Line On
   this->send_command_(0x35);
@@ -266,7 +321,7 @@ void ST7305RLCD::init_display_() {
   this->send_command_(0xD0);
   this->send_data_(0xFF);
 
-  // High Power Mode
+  // High Power Mode On
   this->send_command_(0x38);
 
   // Display On
@@ -275,126 +330,127 @@ void ST7305RLCD::init_display_() {
 
 // =============================================================================
 // Pixel Lookup Table Initialization
-// CRITICAL: Uses x * HEIGHT + y indexing to match Arduino's [x][y] array layout
 // =============================================================================
 
 void ST7305RLCD::init_pixel_lut_() {
-  const size_t total_pixels = ST7305_WIDTH * ST7305_HEIGHT;
-  const size_t lut_bytes = total_pixels * (sizeof(uint16_t) + sizeof(uint8_t));
+  const uint32_t total_pixels = static_cast<uint32_t>(this->width_) * this->height_;
 
-#ifdef USE_ESP32
-  // Try PSRAM first for large allocation
-  size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-  if (free_psram > lut_bytes) {
-    ESP_LOGD(TAG, "Allocating LUTs in PSRAM");
-    this->pixel_index_lut_ = (uint16_t *)heap_caps_malloc(
-        total_pixels * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
-    this->pixel_bit_lut_ = (uint8_t *)heap_caps_malloc(
-        total_pixels * sizeof(uint8_t), MALLOC_CAP_SPIRAM);
-  }
-#endif
+  // Allocate LUTs in PSRAM if available
+  ExternalRAMAllocator<uint16_t> index_allocator(ExternalRAMAllocator<uint16_t>::ALLOW_FAILURE);
+  ExternalRAMAllocator<uint8_t> bit_allocator(ExternalRAMAllocator<uint8_t>::ALLOW_FAILURE);
 
-  // Fallback to regular heap
-  if (this->pixel_index_lut_ == nullptr) {
-    this->pixel_index_lut_ = new (std::nothrow) uint16_t[total_pixels];
-  }
-  if (this->pixel_bit_lut_ == nullptr) {
-    this->pixel_bit_lut_ = new (std::nothrow) uint8_t[total_pixels];
-  }
+  this->pixel_index_lut_ = index_allocator.allocate(total_pixels);
+  this->pixel_bit_lut_ = bit_allocator.allocate(total_pixels);
 
   if (this->pixel_index_lut_ == nullptr || this->pixel_bit_lut_ == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate LUTs for %u pixels", total_pixels);
     return;
   }
 
-  // Build lookup tables using ST7305's 2x4 block pixel arrangement
-  // This matches the Arduino driver's InitLandscapeLUT() exactly
+  ESP_LOGD(TAG, "Building pixel LUTs for %ux%u (%s)...",
+           this->width_, this->height_,
+           this->orientation_ == ST7305_ORIENTATION_LANDSCAPE ? "landscape" : "portrait");
+
+  if (this->orientation_ == ST7305_ORIENTATION_LANDSCAPE) {
+    this->init_lut_landscape_();
+  } else {
+    this->init_lut_portrait_();
+  }
+
+  ESP_LOGD(TAG, "LUT initialization complete");
+}
+
+void ST7305RLCD::init_lut_landscape_() {
+  // Landscape orientation: 2×4 pixel blocks
+  // Reference: Waveshare InitLandscapeLUT() in custom_lcd_display.cc
   //
-  // The ST7305 organizes pixels in 2x4 blocks:
-  // - Each byte contains 8 pixels (2 wide x 4 tall)
-  // - 200 horizontal blocks (400 pixels / 2)
-  // - 75 vertical blocks (300 pixels / 4)
-  // - Total: 200 * 75 = 15000 bytes
-  
-  const uint16_t H4 = ST7305_HEIGHT >> 2;  // 300/4 = 75 vertical blocks
+  // Each byte contains 8 pixels (2 columns × 4 rows):
+  // - Bit 7: (row 0, col 0), Bit 6: (row 0, col 1)
+  // - Bit 5: (row 1, col 0), Bit 4: (row 1, col 1)
+  // - Bit 3: (row 2, col 0), Bit 2: (row 2, col 1)
+  // - Bit 1: (row 3, col 0), Bit 0: (row 3, col 1)
 
-  for (uint16_t y = 0; y < ST7305_HEIGHT; y++) {
-    uint16_t inv_y = ST7305_HEIGHT - 1 - y;  // Invert Y coordinate
-    uint16_t block_y = inv_y >> 2;           // Which vertical block (0-74)
-    uint8_t local_y = inv_y & 3;             // Position within block (0-3)
+  const uint16_t H4 = this->height_ >> 2;  // Vertical blocks (height/4)
 
-    for (uint16_t x = 0; x < ST7305_WIDTH; x++) {
-      uint16_t byte_x = x >> 1;              // Which horizontal block (0-199)
-      uint8_t local_x = x & 1;               // Position within block (0-1)
+  for (uint16_t y = 0; y < this->height_; y++) {
+    const uint16_t inv_y = this->height_ - 1 - y;
+    const uint16_t block_y = inv_y >> 2;
+    const uint8_t local_y = inv_y & 3;
 
-      // Buffer index: column-major within blocks
-      uint32_t buffer_idx = byte_x * H4 + block_y;
-      
-      // Bit position: 2x4 arrangement within byte
-      // Bit 7: (local_y=0, local_x=0), Bit 6: (local_y=0, local_x=1)
-      // Bit 5: (local_y=1, local_x=0), Bit 4: (local_y=1, local_x=1)
-      // ...
-      uint8_t bit = 7 - ((local_y << 1) | local_x);
+    for (uint16_t x = 0; x < this->width_; x++) {
+      const uint16_t byte_x = x >> 1;
+      const uint8_t local_x = x & 1;
 
-      // Store in LUT using column-major order (x * HEIGHT + y)
-      const uint32_t lut_pos = (uint32_t)x * ST7305_HEIGHT + y;
-      this->pixel_index_lut_[lut_pos] = buffer_idx;
-      this->pixel_bit_lut_[lut_pos] = (1 << bit);
+      const uint32_t buffer_idx = byte_x * H4 + block_y;
+      const uint8_t bit = 7 - ((local_y << 1) | local_x);
+
+      const uint32_t pixel_idx = static_cast<uint32_t>(x) * this->height_ + y;
+      this->pixel_index_lut_[pixel_idx] = buffer_idx;
+      this->pixel_bit_lut_[pixel_idx] = (1 << bit);
+    }
+  }
+}
+
+void ST7305RLCD::init_lut_portrait_() {
+  // Portrait orientation: 4×2 pixel blocks
+  // Reference: Waveshare InitPortraitLUT()
+  //
+  // Each byte contains 8 pixels (4 columns × 2 rows):
+  //   col0 col1 col2 col3
+  // row0  b7   b6   b5   b4
+  // row1  b3   b2   b1   b0
+  //
+  // Bit position = 7 - (row * 4 + col)
+
+  const uint16_t W4 = this->width_ >> 2;  // Horizontal blocks (width/4)
+
+  for (uint16_t y = 0; y < this->height_; y++) {
+    const uint16_t byte_y = y >> 1;
+    const uint8_t local_y = y & 1;
+
+    for (uint16_t x = 0; x < this->width_; x++) {
+      const uint16_t byte_x = x >> 2;
+      const uint8_t local_x = x & 3;
+
+      const uint32_t buffer_idx = byte_y * W4 + byte_x;
+      const uint8_t bit = 7 - (local_y * 4 + local_x);
+
+      const uint32_t pixel_idx = static_cast<uint32_t>(x) * this->height_ + y;
+      this->pixel_index_lut_[pixel_idx] = buffer_idx;
+      this->pixel_bit_lut_[pixel_idx] = (1 << bit);
     }
   }
 }
 
 // =============================================================================
-// Pixel Drawing
-// =============================================================================
-
-void HOT ST7305RLCD::draw_absolute_pixel_internal(int x, int y, Color color) {
-  // Bounds check
-  if (x < 0 || x >= ST7305_WIDTH || y < 0 || y >= ST7305_HEIGHT)
-    return;
-  if (this->pixel_index_lut_ == nullptr)
-    return;
-
-  const uint32_t lut_pos = (uint32_t)x * ST7305_HEIGHT + y;
-  const uint16_t buf_idx = this->pixel_index_lut_[lut_pos];
-  const uint8_t bit_mask = this->pixel_bit_lut_[lut_pos];
-
-  // Bit set = white, bit clear = black
-  if (color.is_on()) {
-    this->buffer_[buf_idx] &= ~bit_mask;  // BLACK
-  } else {
-    this->buffer_[buf_idx] |= bit_mask;   // WHITE
-  }
-}
-
-// =============================================================================
-// Display Transfer
-// CRITICAL: Memory write command and data must be sent with CS held LOW
+// Display Write
 // =============================================================================
 
 void ST7305RLCD::write_display_() {
   if (this->buffer_ == nullptr)
     return;
 
-  // Wake display
+  // Ensure display is awake
   this->send_command_(0x38);  // High Power Mode
   this->send_command_(0x29);  // Display On
 
-  // Set address window
-  this->send_command_(0x2A);  // Column address
-  this->send_data_(0x12);
-  this->send_data_(0x2A);
+  // Set column address window
+  this->send_command_(0x2A);
+  this->send_data_(this->col_start_);
+  this->send_data_(this->col_end_);
 
-  this->send_command_(0x2B);  // Row address
-  this->send_data_(0x00);
-  this->send_data_(0xC7);
+  // Set row address window
+  this->send_command_(0x2B);
+  this->send_data_(this->row_start_);
+  this->send_data_(this->row_end_);
 
-  // CRITICAL: Memory write - CS must stay LOW for command + all data
+  // Memory Write - CS must stay LOW for command + all data bytes
   this->dc_pin_->digital_write(false);  // Command mode
   this->enable();                        // CS LOW
   this->write_byte(0x2C);               // Memory Write command
 
   this->dc_pin_->digital_write(true);   // Data mode (CS still LOW)
-  this->write_array(this->buffer_, ST7305_BUFFER_SIZE);
+  this->write_array(this->buffer_, this->buffer_size_);
   this->disable();                       // CS HIGH
 }
 
@@ -414,6 +470,41 @@ void ST7305RLCD::send_data_(uint8_t data) {
   this->enable();
   this->write_byte(data);
   this->disable();
+}
+
+// =============================================================================
+// Power Control
+// =============================================================================
+
+void ST7305RLCD::sleep() {
+  this->send_command_(0x10);  // Sleep In
+  ESP_LOGD(TAG, "Entered sleep mode");
+}
+
+void ST7305RLCD::wake() {
+  this->send_command_(0x11);  // Sleep Out
+  delay(120);
+  ESP_LOGD(TAG, "Exited sleep mode");
+}
+
+void ST7305RLCD::low_power_mode() {
+  this->send_command_(0x39);  // Low Power Mode
+  ESP_LOGD(TAG, "Switched to low power mode");
+}
+
+void ST7305RLCD::high_power_mode() {
+  this->send_command_(0x38);  // High Power Mode
+  ESP_LOGD(TAG, "Switched to high power mode");
+}
+
+void ST7305RLCD::display_on() {
+  this->send_command_(0x29);  // Display On
+  ESP_LOGD(TAG, "Display on");
+}
+
+void ST7305RLCD::display_off() {
+  this->send_command_(0x28);  // Display Off
+  ESP_LOGD(TAG, "Display off");
 }
 
 }  // namespace st7305_rlcd

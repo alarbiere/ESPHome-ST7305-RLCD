@@ -73,12 +73,13 @@ font:
 # =============================================================================
 display:
   - platform: st7305_rlcd
+    model: WAVESHARE_400X300
     rotation: 0
     id: my_display
     cs_pin: GPIO40
     dc_pin: GPIO5
     reset_pin: GPIO41
-    update_interval: 1s
+    update_interval: never
     
     lambda: |-
       // Get dimensions
@@ -88,3 +89,4 @@ display:
       // Print "Hello World!" in the center of the screen
       // Arguments: x, y, font_id, color, alignment, text
       it.printf(w / 2, h / 2, id(roboto), COLOR_ON, TextAlign::CENTER, "Hello World!");
+      id(my_display).sleep();
