@@ -82,8 +82,8 @@ async def to_code(config):
     """Generate C++ code from configuration."""
     var = cg.new_Pvariable(config[CONF_ID])
 
-    # Register with all parent classes
-    await cg.register_component(var, config)
+    # Register with parent classes
+    # Note: register_display() calls register_component() internally
     await display.register_display(var, config)
     await spi.register_spi_device(var, config)
 
