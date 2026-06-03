@@ -343,7 +343,7 @@ void ST7305RLCD::init_pixel_lut_() {
   this->pixel_bit_lut_ = bit_allocator.allocate(total_pixels);
 
   if (this->pixel_index_lut_ == nullptr || this->pixel_bit_lut_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to allocate LUTs for %u pixels", total_pixels);
+    ESP_LOGE(TAG, "Failed to allocate LUTs for %lu pixels", total_pixels);
     return;
   }
 
